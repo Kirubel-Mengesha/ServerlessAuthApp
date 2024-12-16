@@ -1,0 +1,268 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Parameters:
+  StackName:
+    Type: String
+    Default: "myapp" # Set a default in lowercase
+
+Resources:
+  # CloudFront Origin Access Control (OAC)
+  MyCloudFrontOAC:
+    Type: "AWS::CloudFront::OriginAccessControl"
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${StackName}-oac"
+        OriginAccessControlOriginType: "s3"
+        SigningBehavior: "always"
+        SigningProtocol: "sigv4"
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub "${StackName}-lambdaexecutionrole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "lambda.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: LambdaS3DynamoDBApiGatewayCloudWatchAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "s3:*"
+                  - "dynamodb:*"
+                  - "apigateway:*"
+                  - "logs:*"
+                  - "cloudwatch:*"
+                Resource: "*"
+
+  # Lambda Function
+  MyLambdaFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      FunctionName: !Sub "${StackName}-mylambdafunction"
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: "nodejs20.x"
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: lambda-code.zip
+      MemorySize: 128
+      Timeout: 30
+
+  # S3 Bucket for Lambda Code
+  CodeBucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName: !Sub "bw-cc-fp-backend-bucket-${AWS::AccountId}-${AWS::Region}-${StackName}" # Ensure this is lowercase
+      Tags:
+        - Key: "Environment"
+          Value: "Dev"
+
+  # S3 Bucket for Frontend
+  MyS3Bucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName: !Sub "bw-cc-fp-frontend-bucket-${AWS::AccountId}-${AWS::Region}-${StackName}" # Ensure this is lowercase
+      Tags:
+        - Key: "Environment"
+          Value: "Dev"
+
+  # S3 Bucket Policy to Allow CloudFront OAC
+  MyBucketPolicy:
+    Type: "AWS::S3::BucketPolicy"
+    Properties:
+      Bucket: !Ref MyS3Bucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontAccess
+            Effect: Allow
+            Action: "s3:GetObject"
+            Resource: !Sub "arn:aws:s3:::${MyS3Bucket}/*"
+            Principal:
+              AWS: !GetAtt MyCloudFrontOAC.Id  # Use OriginAccessControlId from OAC
+
+  # CloudFront Distribution with OAC
+  MyCloudFrontDistribution:
+    Type: "AWS::CloudFront::Distribution"
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt MyS3Bucket.DomainName
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub "arn:aws:cloudfront::${AWS::AccountId}:origin-access-identity/cloudfront/${MyCloudFrontOAC.Id}"
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: "redirect-to-https"
+          AllowedMethods:
+            - GET
+            - HEAD
+          CachedMethods:
+            - GET
+            - HEAD
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: "none"
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+        DefaultRootObject: index.html
+
+  # API Gateway
+  MyApiGateway:
+    Type: "AWS::ApiGateway::RestApi"
+    Properties:
+      Name: !Sub "${StackName}-myapigateway"
+
+  # DynamoDB Table
+  MyDynamoDBTable:
+    Type: "AWS::DynamoDB::Table"
+    Properties:
+      TableName: !Sub "${StackName}-mydynamodbtable"
+      AttributeDefinitions:
+        - AttributeName: "Id"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "Id"
+          KeyType: "HASH"
+      BillingMode: PAY_PER_REQUEST
+
+  # CodePipeline for Frontend
+  FrontendPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !GetAtt CodePipelineExecutionRole.Arn
+      ArtifactStore:  # Define the artifact store
+        Type: S3
+        Location: !Ref MyS3Bucket  # Ensure this references a valid bucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: S3
+                Version: 1
+              OutputArtifacts:
+                - Name: SourceOutput
+              Configuration:
+                S3Bucket: !Ref MyS3Bucket
+                S3ObjectKey: frontend-source.zip
+              RunOrder: 1
+
+        - Name: Build
+          Actions:
+            - Name: BuildAction
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: 1
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+              Configuration:
+                ProjectName: !Sub "${StackName}-frontendbuild"
+              RunOrder: 1
+
+        - Name: Deploy
+          Actions:
+            - Name: DeployAction
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: S3
+                Version: 1
+              InputArtifacts:
+                - Name: BuildOutput
+              Configuration:
+                BucketName: !Ref MyS3Bucket
+                Extract: true
+              RunOrder: 1
+
+  # IAM Role for CodePipeline
+  CodePipelineExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodePipelinePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:*
+                  - codebuild:*
+                  - lambda:InvokeFunction
+                Resource: "*"
+
+  # CodeBuild Project for Frontend
+  FrontendBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${StackName}-frontendbuild"
+      Source:
+        Type: S3
+        Location: !Sub "${StackName}-frontend-source-bucket/${StackName}-frontend-source.zip"
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: BUILD_GENERAL1_MEDIUM  # Changed from SMALL to MEDIUM
+        Image: aws/codebuild/nodejs:20  # Use a newer Node.js image
+        Type: LINUX_CONTAINER
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+
+  # IAM Role for CodeBuild
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:*
+                Resource: "*"
+
+Outputs:
+  LambdaFunctionArn:
+    Value: !GetAtt MyLambdaFunction.Arn
+    Description: The ARN of the Lambda function
+  S3BucketName:
+    Value: !Ref MyS3Bucket
+    Description: The name of the S3 bucket
+  CloudFrontDistributionId:
+    Value: !Ref MyCloudFrontDistribution
+    Description: The ID of the CloudFront distribution
+  DynamoDBTableName:
+    Value: !Ref MyDynamoDBTable
+    Description: The name of the DynamoDB table
+  ApiGatewayUrl:
+    Value: !Sub "https://${MyApiGateway}.execute-api.${AWS::Region}.amazonaws.com/"
+    Description: The base URL of the API Gateway
